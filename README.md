@@ -263,3 +263,72 @@ tid=63搬: idx = 63, 127, 191, ..., 1023
 nvcc -std=c++17 -arch=sm_75 gemm_tiling.cu -o gemm_tiling.exe
 .\gemm_tiling.exe
 ```
+
+---
+
+## WMMA + CUTLASS 编译运行（WSL）
+
+`gemm_wmma.cu` 同时包含手写 WMMA Tensor Core kernel 和官方 CUTLASS `cutlass::gemm::device::Gemm` 调用，因此编译时需要让 `nvcc` 找到 CUTLASS 官方仓库的头文件。
+
+如果已经在 WSL 中写入环境变量：
+
+```bash
+echo 'export CUTLASS_PATH="/mnt/e/Program Files/cutlass/cutlass"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+之后进入当前项目目录：
+
+```bash
+cd "/mnt/e/Program Files/cutlass/cutlass-learing"
+```
+
+先确认 CUTLASS 头文件路径有效：
+
+```bash
+echo "$CUTLASS_PATH"
+ls "$CUTLASS_PATH/include/cutlass/cutlass.h"
+```
+
+编译 `gemm_wmma.cu`：
+
+```bash
+nvcc -std=c++17 -arch=sm_75 --expt-relaxed-constexpr \
+  -I"$CUTLASS_PATH/include" \
+  -I"$CUTLASS_PATH/tools/util/include" \
+  gemm_wmma.cu -o gemm_wmma
+```
+
+默认编译使用完整 CUTLASS 调用流程：
+
+```cpp
+can_implement -> get_workspace_size -> initialize -> gemm_op()
+```
+
+若需切换到简洁调用风格：
+
+```cpp
+gemm_op(args)
+```
+
+可以编译时打开宏：
+
+```bash
+nvcc -std=c++17 -arch=sm_75 --expt-relaxed-constexpr \
+  -I"$CUTLASS_PATH/include" \
+  -I"$CUTLASS_PATH/tools/util/include" \
+  -DUSE_CUTLASS_MINIMAL_API=1 \
+  gemm_wmma.cu -o gemm_wmma_minimal
+```
+
+运行：
+
+```bash
+./gemm_wmma
+```
+
+也可以指定矩阵大小：
+
+```bash
+./gemm_wmma 512 512 512
+```
