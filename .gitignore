@@ -1,0 +1,27 @@
+# Local build outputs
+*.exe
+*.out
+*.o
+*.obj
+*.lib
+*.dll
+*.so
+*.a
+
+# CUDA generated files
+*.cubin
+*.fatbin
+*.ptx
+*.sass
+
+# Project executables built without extensions on Linux/WSL
+gemm_tiling
+gemm_wmma
+operator_fusion
+softmax_attention
+softmax_attention_naive
+
+# Temporary/editor files
+*.tmp
+*.log
+.vscode/

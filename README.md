@@ -267,7 +267,7 @@ nvcc -std=c++17 -arch=sm_75 gemm_tiling.cu -o gemm_tiling.exe
 
 ---
 
-## WMMA + CUTLASS 编译运行（WSL）
+# WMMA + CUTLASS 编译运行（WSL）
 
 `gemm_wmma.cu` 同时包含手写 WMMA Tensor Core kernel 和官方 CUTLASS `cutlass::gemm::device::Gemm` 调用，因此编译时需要让 `nvcc` 找到 CUTLASS 官方仓库的头文件。
 
@@ -392,3 +392,37 @@ Threadblock tile -> Warp tile -> Tensor Core instruction tile
 ```bash
 ./gemm_wmma 512 512 512
 ```
+
+# softmax attention
+
+## Benchmark record: naive GEMM vs outer-product GEMM
+
+Test command shape:
+
+```bash
+./softmax_attention_naive 1024 1024 1024
+./softmax_attention 1024 1024 1024
+```
+
+Compile commands:
+
+```bash
+# Naive GEMM path
+nvcc -std=c++17 -arch=sm_75 -DUSE_OUTER_GEMM=0 softmax_attention.cu -o softmax_attention_naive
+
+# Outer-product tiled GEMM path, default
+nvcc -std=c++17 -arch=sm_75 softmax_attention.cu -o softmax_attention
+```
+
+Result:
+
+| Path | Total avg time | transpose(K) | QK^T GEMM | softmax | ProbV GEMM | Check |
+|------|----------------|--------------|-----------|---------|------------|-------|
+| naive GEMM | 28.3881 ms | 0.0555 ms | 12.5251 ms | 1.2897 ms | 12.4880 ms | PASS |
+| outer-product tiled GEMM | 5.4300 ms | 0.0628 ms | 1.1591 ms | 1.5600 ms | 1.1574 ms | PASS |
+
+Observation:
+
+The outer-product tiled GEMM path significantly reduces both GEMM stages in this
+baseline attention example. The softmax stage now becomes a more visible part of
+the total runtime, which is a useful next optimization target.
