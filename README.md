@@ -238,7 +238,8 @@ tid=63搬: idx = 63, 127, 191, ..., 1023
 | 本代码中的概念 | CUTLASS 中的概念 | 作用 |
 |--------------|-----------------|------|
 | OP_BM×OP_BN = 64×64 | `ThreadblockShape` | 一个线程块负责的 C 输出区域 |
-| OP_TM×OP_TN = 8×8 | `WarpShape` / `InstructionShape` | 一个线程负责的输出子块 |
+| OP_TM×OP_TN = 8×8 | 无直接等价参数，可粗略理解为 thread-level micro tile | 手写 kernel 中一个线程负责的输出子块 |
+| OP_THREADS_M×OP_THREADS_N = 8×8 | CTA 内线程布局 | 手写 kernel 的 block 线程组织方式，不等同于 CUTLASS 的 `WarpShape` |
 | stride loop 协作加载 | `TiledCopy` + `Copy_Atom` | 所有线程均匀搬运 global→shared |
 | regA⊗regB 外积累加 | `MMA_Atom` / `TiledMMA` | 最小计算单元，一次 load 最大 FMA |
 | SMEM_PAD = 1 | CuTe `Swizzle` / padding | 消除 shared memory bank conflict |
@@ -320,6 +321,65 @@ nvcc -std=c++17 -arch=sm_75 --expt-relaxed-constexpr \
   -DUSE_CUTLASS_MINIMAL_API=1 \
   gemm_wmma.cu -o gemm_wmma_minimal
 ```
+
+### `cutlass::gemm::device::Gemm` 参数说明
+
+完整 GEMM 模板参数可概括为：
+
+```cpp
+cutlass::gemm::device::Gemm<
+  ElementA, LayoutA,
+  ElementB, LayoutB,
+  ElementC, LayoutC,
+  ElementAccumulator,
+  OperatorClass,
+  ArchTag,
+  ThreadblockShape,
+  WarpShape,
+  InstructionShape,
+  EpilogueOutputOp,
+  ThreadblockSwizzle,
+  Stages,
+  AlignmentA,
+  AlignmentB,
+  SplitKSerial,
+  Operator
+>
+```
+
+| 参数 | 含义 |
+|---|---|
+| `ElementA/LayoutA` | A 矩阵元素类型与布局 |
+| `ElementB/LayoutB` | B 矩阵元素类型与布局 |
+| `ElementC/LayoutC` | C/D 矩阵元素类型与布局 |
+| `ElementAccumulator` | MMA 累加器类型 |
+| `OperatorClass` | 计算单元类型，`OpClassTensorOp` 表示 Tensor Core |
+| `ArchTag` | 目标 GPU 架构，如 `Sm75` |
+| `ThreadblockShape` | CTA/block 级 GEMM tile |
+| `WarpShape` | warp 级 GEMM tile |
+| `InstructionShape` | 底层 MMA 指令 tile |
+| `EpilogueOutputOp` | 输出阶段操作，如 `D = alpha * acc + beta * C` |
+| `ThreadblockSwizzle` | thread block 到输出 tile 的映射方式 |
+| `Stages` | mainloop pipeline stage 数 |
+| `AlignmentA/AlignmentB` | A/B 全局内存访问对齐 |
+| `SplitKSerial` | 是否启用 serial split-K |
+| `Operator` | 底层 multiply-add 操作，通常使用默认值 |
+
+当前 `gemm_wmma.cu` 显式设置三层 `GemmShape`：
+
+```cpp
+cutlass::gemm::GemmShape<128, 128, 32>  // ThreadblockShape
+cutlass::gemm::GemmShape<64, 64, 32>    // WarpShape
+cutlass::gemm::GemmShape<16, 8, 8>      // InstructionShape
+```
+
+这是为了展示 CUTLASS GEMM 的层级划分：
+
+```text
+Threadblock tile -> Warp tile -> Tensor Core instruction tile
+```
+
+官方 `basic_gemm.cu` 通常只写前几个参数，是因为后续参数有默认配置；本项目显式写出这些参数，是为了教学中清楚展示 Tensor Core 路径和 tiling 层级。
 
 运行：
 
