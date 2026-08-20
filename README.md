@@ -45,7 +45,7 @@ Speedup (outer-opt vs naive):  4.54x
 
 ---
 
-## Outer-opt 优化详解 (面向初学者)
+## Outer-opt 优化详解 
 
 原版 outer 的**算法思想是正确的**（外积），但**实现有三个致命问题**：
 
@@ -395,7 +395,7 @@ Threadblock tile -> Warp tile -> Tensor Core instruction tile
 
 # softmax attention
 
-## Benchmark record: naive GEMM vs outer-product GEMM
+## Benchmark record
 
 Test command shape:
 
@@ -420,9 +420,18 @@ Result:
 |------|----------------|--------------|-----------|---------|------------|-------|
 | naive GEMM | 28.3881 ms | 0.0555 ms | 12.5251 ms | 1.2897 ms | 12.4880 ms | PASS |
 | outer-product tiled GEMM | 5.4300 ms | 0.0628 ms | 1.1591 ms | 1.5600 ms | 1.1574 ms | PASS |
+| outer GEMM + embedded K transpose + block softmax | 4.1625 ms | embedded | 2.0673 ms | 0.0646 ms | 1.1554 ms | PASS |
 
 Observation:
 
 The outer-product tiled GEMM path significantly reduces both GEMM stages in this
 baseline attention example. The softmax stage now becomes a more visible part of
-the total runtime, which is a useful next optimization target.
+the total runtime, which makes it the next useful optimization target.
+
+The optimized softmax version keeps the outer-product tiled GEMM path, removes
+the standalone `transpose_kernel` from the QK^T stage, embeds K transpose into
+`qkt_gemm_kernel_opt`, and changes softmax from one-thread-per-row to
+one-block-per-row. Block-level softmax reduces the softmax stage from about
+`1.5600 ms` to `0.0646 ms`. QK^T GEMM becomes slower because K is now read in
+the logical transposed layout inside the GEMM kernel, but the total runtime still
+drops to `4.1625 ms`.

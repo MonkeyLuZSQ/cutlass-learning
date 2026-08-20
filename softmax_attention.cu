@@ -30,8 +30,8 @@
 //shared memory padding to avoid bank conflicts
 #define PAD 1
 
-#define WARMUP_ITERS 5
-#define BENCH_ITERS 20
+#define WARMUP_ITERS 2
+#define BENCH_ITERS 5
 
 #ifndef USE_OUTER_GEMM
 #define USE_OUTER_GEMM 1
@@ -178,34 +178,165 @@ __global__ void gemm_kernel_opt(float* C,
 		}
 }
 
+// QK^T outer-product GEMM.
+// A is Q[M, K], B is original K[N, K], C is Scores[M, N].
+// This kernel embeds the logical transpose of K into the B tile load:
+//
+//   C[row, col] += Q[row, k] * K[col, k]
+//
+// It removes the external transpose_kernel + K_trans temporary buffer from the
+// outer-product GEMM path. It is not used for Prob * V, because that second GEMM
+// uses V[N, d] as a normal row-major B matrix.
+__global__ void qkt_gemm_kernel_opt(float* C,
+                                    const float* A,
+                                    const float* B,
+                                    int M,
+                                    int N,
+                                    int K) {
+    __shared__ float As[OP_BM][OP_BK + PAD];
+    __shared__ float Bs[OP_BK][OP_BN + PAD];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int row = blockIdx.y * OP_BM + ty * OP_TM;
+    int col = blockIdx.x * OP_BN + tx * OP_TN;
+
+    int tid = ty * blockDim.x + tx;
+    int num_threads = OP_THREADS_M * OP_THREADS_N;
+
+    float regC[OP_TM][OP_TN];
+    #pragma unroll
+    for(int i = 0; i < OP_TM; ++i) {
+        #pragma unroll
+        for(int j = 0; j < OP_TN; ++j) {
+            regC[i][j] = 0.0f;
+        }
+    }
+
+    for(int kk = 0; kk < K; kk += OP_BK)
+    {
+        #pragma unroll
+        for(int idx = tid; idx < OP_BM * OP_BK; idx += num_threads)
+        {
+            int r = idx / OP_BK;
+            int c = idx % OP_BK;
+            int gr = blockIdx.y * OP_BM + r;
+            int gc = kk + c;
+            As[r][c] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0f;
+        }
+
+        #pragma unroll
+        for (int idx = tid; idx < OP_BK * OP_BN; idx += num_threads)
+        {
+            int r = idx / OP_BN;
+            int c = idx % OP_BN;
+            int gr = kk + r;
+            int gc = blockIdx.x * OP_BN + c;
+            Bs[r][c] = (gr < K && gc < N) ? B[gc * K + gr] : 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for(int k = 0; k < OP_BK; ++k)
+        {
+            float regA[OP_TM];
+            #pragma unroll
+            for(int i = 0; i < OP_TM; ++i)
+            {
+                regA[i] = As[ty * OP_TM + i][k];
+            }
+
+            float regB[OP_TN];
+            #pragma unroll
+            for(int j = 0; j < OP_TN; ++j)
+            {
+                regB[j] = Bs[k][tx * OP_TN + j];
+            }
+
+            #pragma unroll
+            for (int i = 0; i < OP_TM; ++i)
+                #pragma unroll
+                for (int j = 0; j < OP_TN; ++j)
+                    regC[i][j] += regA[i] * regB[j];
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < OP_TM; ++i)
+        #pragma unroll
+        for (int j = 0; j < OP_TN; ++j)
+        {
+            int r = row + i;
+            int c = col + j;
+            if (r < M && c < N)
+                C[r * N + c] = regC[i][j];
+        }
+}
+
 // Row-wise softmax. One thread handles one row.
+// opt: one block one row
 __global__ void softmax_kernel(float* A, int d, int M, int N) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
     if (row >= M) return;
 
     float temp = sqrtf((float)d);
     float* row_ptr = A + row * N;
 
-    for (int j = 0; j < N; ++j) {
-        row_ptr[j] /= temp;
+    // each thread has its own local max
+    float local_max = -INFINITY;
+    for (int j = tid; j < N; j += blockDim.x) {
+        float val = row_ptr[j] / temp;
+        row_ptr[j] = val;
+        local_max = fmaxf(local_max, val);
     }
 
-    float max_val = -INFINITY;
-    for (int j = 0; j < N; ++j) {
-        if (row_ptr[j] > max_val) max_val = row_ptr[j];
-    }
+    //block reduce
+    __shared__ float smem[256];
+    smem[tid] = local_max;
+    __syncthreads();
 
-    float sum = 0.0f;
-    for (int j = 0; j < N; ++j) {
+    for(int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if(tid < stride)
+        {
+            smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float max_val = smem[0];
+
+    //exp + sum
+    float local_sum = 0.0f;
+    for(int j = tid; j < N; j += blockDim.x)
+    {
         float e = expf(row_ptr[j] - max_val);
         row_ptr[j] = e;
-        sum += e;
+        local_sum += e;
     }
 
+    //block reduce
+    smem[tid] = local_sum;
+    __syncthreads();
+    for(int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if(tid < stride)
+        {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+    float sum = smem[0];
+
     float inv_sum = 1.0f / sum;
-    for (int j = 0; j < N; ++j) {
+
+    for (int j = tid; j < N; j += blockDim.x) {
         row_ptr[j] *= inv_sum;
     }
+
 }
 
 void solve_impl(const float* Q,
@@ -218,6 +349,7 @@ void solve_impl(const float* Q,
                 KernelTimes* times,
                 cudaEvent_t start,
                 cudaEvent_t stop) {
+#ifndef USE_SELECTED_OUTER_GEMM
     float* K_trans = nullptr;
     CUDA_CHECK(cudaMalloc(&K_trans, (size_t)N * d * sizeof(float)));
     CUDA_CHECK(cudaMemset(K_trans, 0, (size_t)N * d * sizeof(float)));
@@ -228,6 +360,10 @@ void solve_impl(const float* Q,
     transpose_kernel<<<gridsize_trans, blocksize>>>(K_trans, K, N, d);
     CUDA_CHECK(cudaGetLastError());
     if (times) record_kernel_time(start, stop, &times->transpose_ms);
+#else
+    dim3 blocksize(16, 16);
+    if (times) times->transpose_ms = 0.0f;
+#endif
 
     float* C = nullptr;
     CUDA_CHECK(cudaMalloc(&C, (size_t)M * N * sizeof(float)));
@@ -235,9 +371,9 @@ void solve_impl(const float* Q,
 
 #ifdef USE_SELECTED_OUTER_GEMM
     dim3 blocksize_opt(OP_THREADS_N, OP_THREADS_M);
-    dim3 gridsize_QK((N + OP_BN - 1) / OP_BN, (M + OP_TM - 1) / OP_BM);
+    dim3 gridsize_QK((N + OP_BN - 1) / OP_BN, (M + OP_BM - 1) / OP_BM);
     if (times) CUDA_CHECK(cudaEventRecord(start));
-    gemm_kernel_opt<<<gridsize_QK, blocksize_opt>>>(C, Q, K_trans, M, N, d);
+    qkt_gemm_kernel_opt<<<gridsize_QK, blocksize_opt>>>(C, Q, K, M, N, d);
     CUDA_CHECK(cudaGetLastError());
 #else
     dim3 gridsize_QK((N + 16 - 1) / 16, (M + 16 - 1) / 16);
@@ -247,14 +383,15 @@ void solve_impl(const float* Q,
 #endif
     if (times) record_kernel_time(start, stop, &times->qk_gemm_ms);
 
-    gridsize_QK = dim3((M + 255) / 256, 1);
+    dim3 grid_softmax(M);
+    dim3 block_softmax(256);
     if (times) CUDA_CHECK(cudaEventRecord(start));
-    softmax_kernel<<<gridsize_QK, 256>>>(C, d, M, N);
+    softmax_kernel<<<grid_softmax, block_softmax>>>(C, d, M, N);
     CUDA_CHECK(cudaGetLastError());
     if (times) record_kernel_time(start, stop, &times->softmax_ms);
 
 #ifdef USE_SELECTED_OUTER_GEMM
-    dim3 gridsize_CV((d + OP_BN - 1) / OP_BN, (M + OP_TM - 1) / OP_BM);
+    dim3 gridsize_CV((d + OP_BN - 1) / OP_BN, (M + OP_BM - 1) / OP_BM);
     if (times) CUDA_CHECK(cudaEventRecord(start));
     gemm_kernel_opt<<<gridsize_CV, blocksize_opt>>>(output, C, V, M, d, N);
     CUDA_CHECK(cudaGetLastError());
@@ -266,7 +403,9 @@ void solve_impl(const float* Q,
 #endif
     if (times) record_kernel_time(start, stop, &times->cv_gemm_ms);
 
+#ifndef USE_SELECTED_OUTER_GEMM
     CUDA_CHECK(cudaFree(K_trans));
+#endif
     CUDA_CHECK(cudaFree(C));
 }
 
@@ -465,16 +604,22 @@ int main(int argc, char** argv) {
     printf("  Shape: M=%d, N=%d, d=%d\n", M, N, d);
     printf("  Flow: transpose(K) -> Q*K^T -> softmax -> Prob*V\n");
 #ifdef USE_SELECTED_OUTER_GEMM
-    printf("  GEMM kernel: outer-product tiled GEMM (USE_OUTER_GEMM=1)\n");
+    printf("  GEMM kernel: QK^T outer GEMM + normal outer GEMM (USE_OUTER_GEMM=1)\n");
+    printf("  K transpose: embedded in qkt_gemm_kernel_opt\n");
 #else
     printf("  GEMM kernel: naive GEMM (USE_OUTER_GEMM=0)\n");
+    printf("  K transpose: external transpose_kernel\n");
 #endif
     printf("  Timing: %d warmup runs, then average of %d timed runs\n",
            WARMUP_ITERS,
            BENCH_ITERS);
     printf("  Average time: %.4f ms\n", ms);
     printf("  Kernel average times:\n");
+#ifdef USE_SELECTED_OUTER_GEMM
+    printf("    transpose(K): embedded, no standalone kernel\n");
+#else
     printf("    transpose(K): %.4f ms\n", per_kernel_times.transpose_ms);
+#endif
     printf("    Q*K^T GEMM:   %.4f ms\n", per_kernel_times.qk_gemm_ms);
     printf("    softmax:      %.4f ms\n", per_kernel_times.softmax_ms);
     printf("    Prob*V GEMM:  %.4f ms\n", per_kernel_times.cv_gemm_ms);
