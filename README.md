@@ -393,45 +393,49 @@ Threadblock tile -> Warp tile -> Tensor Core instruction tile
 ./gemm_wmma 512 512 512
 ```
 
-# softmax attention
+# Softmax Attention
 
-## Benchmark record
+## 性能记录
 
-Test command shape:
+测试矩阵规模：
 
 ```bash
 ./softmax_attention_naive 1024 1024 1024
 ./softmax_attention 1024 1024 1024
 ```
 
-Compile commands:
+编译命令：
 
 ```bash
-# Naive GEMM path
+# 朴素 GEMM 路径
 nvcc -std=c++17 -arch=sm_75 -DUSE_OUTER_GEMM=0 softmax_attention.cu -o softmax_attention_naive
 
-# Outer-product tiled GEMM path, default
+# 外积分块 GEMM 路径，默认开启
 nvcc -std=c++17 -arch=sm_75 softmax_attention.cu -o softmax_attention
 ```
 
-Result:
+测试结果：
 
-| Path | Total avg time | transpose(K) | QK^T GEMM | softmax | ProbV GEMM | Check |
+| 路径 | 总平均时间 | transpose(K) | QK^T GEMM | softmax | ProbV GEMM | 校验 |
 |------|----------------|--------------|-----------|---------|------------|-------|
-| naive GEMM | 28.3881 ms | 0.0555 ms | 12.5251 ms | 1.2897 ms | 12.4880 ms | PASS |
-| outer-product tiled GEMM | 5.4300 ms | 0.0628 ms | 1.1591 ms | 1.5600 ms | 1.1574 ms | PASS |
-| outer GEMM + embedded K transpose + block softmax | 4.1625 ms | embedded | 2.0673 ms | 0.0646 ms | 1.1554 ms | PASS |
+| 朴素 GEMM | 28.3881 ms | 0.0555 ms | 12.5251 ms | 1.2897 ms | 12.4880 ms | PASS |
+| 外积分块 GEMM | 5.4300 ms | 0.0628 ms | 1.1591 ms | 1.5600 ms | 1.1574 ms | PASS |
+| 外积分块 GEMM + 嵌入式 K 转置 + block 级 softmax | 4.1625 ms | 已嵌入 | 2.0673 ms | 0.0646 ms | 1.1554 ms | PASS |
 
-Observation:
+结果分析：
 
-The outer-product tiled GEMM path significantly reduces both GEMM stages in this
-baseline attention example. The softmax stage now becomes a more visible part of
-the total runtime, which makes it the next useful optimization target.
+外积分块 GEMM 相比朴素 GEMM 明显降低了两个 GEMM 阶段的耗时：
+`QK^T GEMM` 从 `12.5251 ms` 降到 `1.1591 ms`，`ProbV GEMM` 从
+`12.4880 ms` 降到 `1.1574 ms`。此时 softmax 从原本不显眼的部分变成
+整体耗时中更突出的阶段，因此成为下一步优化重点。
 
-The optimized softmax version keeps the outer-product tiled GEMM path, removes
-the standalone `transpose_kernel` from the QK^T stage, embeds K transpose into
-`qkt_gemm_kernel_opt`, and changes softmax from one-thread-per-row to
-one-block-per-row. Block-level softmax reduces the softmax stage from about
-`1.5600 ms` to `0.0646 ms`. QK^T GEMM becomes slower because K is now read in
-the logical transposed layout inside the GEMM kernel, but the total runtime still
-drops to `4.1625 ms`.
+进一步优化后，代码保留外积分块 GEMM 路径，但取消了 QK^T 阶段独立的
+`transpose_kernel`，将 K 的逻辑转置嵌入到 `qkt_gemm_kernel_opt` 中完成。
+同时，softmax 从“一线程处理一整行”改为“一 block 协作处理一整行”，
+通过 block 内并行归约完成行最大值和行求和。该优化将 softmax 阶段从
+`1.5600 ms` 降到 `0.0646 ms`。
+
+需要注意的是，嵌入式 K 转置会使 `QK^T GEMM` 内部以逻辑转置方式读取 K，
+访存连续性不如显式转置后的 `K_trans`，因此 `QK^T GEMM` 时间从
+`1.1591 ms` 增加到 `2.0673 ms`。不过由于 block 级 softmax 带来的收益更大，
+总平均时间仍然进一步下降到 `4.1625 ms`。
