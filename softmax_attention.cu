@@ -2,6 +2,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <float.h>
 
 #define CUDA_CHECK(call)                                                       \
     do {                                                                       \
@@ -35,6 +36,10 @@
 
 #ifndef USE_OUTER_GEMM
 #define USE_OUTER_GEMM 1
+#endif
+
+#ifndef USE_QKT_SOFTMAX_FUSED
+#define USE_QKT_SOFTMAX_FUSED 0
 #endif
 
 #if USE_OUTER_GEMM
@@ -339,6 +344,103 @@ __global__ void softmax_kernel(float* A, int d, int M, int N) {
 
 }
 
+#if USE_QKT_SOFTMAX_FUSED
+// Teaching TODO:
+// Implement this kernel yourself. The solver below expects this exact interface.
+//
+// Required behavior:
+//   Q[M, d] and K[N, d] are row-major.
+//   C[M, N] should be written as softmax(Q * K^T / sqrt(d)).
+//
+// Suggested launch model:
+//   one CUDA block handles one row of Q.
+//   blockDim.x threads compute all N scores for that row, reduce max/sum inside
+//   the block, and write the normalized probability row to C.
+//
+// Dynamic shared memory provided by solve_qkt_softmax_fused:
+//   (N + blockDim.x) * sizeof(float)
+// You can use the first N floats for scores and the rest for block reduction.
+__global__ void qkt_softmax_fused_kernel(float* C,
+                                         const float* Q, //[M, d]
+                                         const float* K, //[N, d]
+                                         int M,
+                                         int N,
+                                         int d)
+{
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    extern __shared__ float shared[];
+    float* scores = shared;
+    float* reduce = shared + N;
+
+    if(row >= M)
+    {
+        return;
+    }
+
+    float scale = rsqrtf((float)d);
+
+    //1. 计算当前Q行和所有K行的点积
+    for(int col = tid; col < N; col += blockDim.x)
+    {
+        float acc = 0.0f;
+        for(int k = 0; k < d; ++k)
+        {
+            acc += Q[row * d + k] * K[col * d + k];
+        }
+        scores[col] = acc * scale;
+    }
+    __syncthreads();
+
+    // 2. 求softmax的行最大值
+    float local_max = -FLT_MAX;
+    for(int col = tid; col < N; col += blockDim.x)
+    {
+        local_max = fmaxf(local_max, scores[col]);
+    }
+    reduce[tid] = local_max;
+    __syncthreads();
+
+    for(int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if(tid < stride)
+        {
+            reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    float row_max = reduce[0];
+
+    //3 计算exp(score - max)并求和
+    float local_sum = 0.0f;
+    for(int col = tid; col < N; col += blockDim.x)
+    {
+        float value = expf(scores[col] - row_max);
+        scores[col] = value;
+        local_sum += value;
+    }
+
+    reduce[tid] = local_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce[tid] += reduce[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float row_sum = reduce[0];
+
+    // 4. 写回 softmax 结果
+    for (int col = tid; col < N; col += blockDim.x) {
+        C[row * N + col] = scores[col] / row_sum;
+    }
+
+}
+#endif
+
 void solve_impl(const float* Q,
                 const float* K,
                 const float* V,
@@ -409,6 +511,77 @@ void solve_impl(const float* Q,
     CUDA_CHECK(cudaFree(C));
 }
 
+#if USE_QKT_SOFTMAX_FUSED
+void solve_qkt_softmax_fused(const float* Q,
+                             const float* K,
+                             const float* V,
+                             float* output,
+                             int M,
+                             int N,
+                             int d,
+                             KernelTimes* times,
+                             cudaEvent_t start,
+                             cudaEvent_t stop) {
+    float* C = nullptr;
+    CUDA_CHECK(cudaMalloc(&C, (size_t)M * N * sizeof(float)));
+
+    dim3 grid_qkt_softmax(M);
+    dim3 block_qkt_softmax(256);
+    size_t shared_bytes =
+        ((size_t)N + (size_t)block_qkt_softmax.x) * sizeof(float);
+
+    int device = 0;
+    int max_shared_bytes = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&max_shared_bytes,
+                                      cudaDevAttrMaxSharedMemoryPerBlock,
+                                      device));
+    if (shared_bytes > (size_t)max_shared_bytes) {
+        fprintf(stderr,
+                "qkt_softmax_fused_kernel needs %zu bytes shared memory, "
+                "but this device allows %d bytes per block. Reduce N or "
+                "rewrite the kernel with tiled/online softmax.\n",
+                shared_bytes,
+                max_shared_bytes);
+        exit(EXIT_FAILURE);
+    }
+
+    // Fused stage:
+    //   QK^T GEMM + row-wise softmax -> C[M, N]
+    //
+    // Because QK^T and softmax are now in the same CUDA kernel, their time
+    // cannot be measured separately. For reporting, qk_gemm_ms records the
+    // fused QK^T+softmax time, and softmax_ms is kept at 0.
+    if (times) CUDA_CHECK(cudaEventRecord(start));
+    qkt_softmax_fused_kernel<<<grid_qkt_softmax,
+                               block_qkt_softmax,
+                               shared_bytes>>>(C, Q, K, M, N, d);
+    CUDA_CHECK(cudaGetLastError());
+    if (times) {
+        record_kernel_time(start, stop, &times->qk_gemm_ms);
+        times->softmax_ms += 0.0f;
+        times->transpose_ms += 0.0f;
+    }
+
+#ifdef USE_SELECTED_OUTER_GEMM
+    dim3 blocksize_opt(OP_THREADS_N, OP_THREADS_M);
+    dim3 gridsize_CV((d + OP_BN - 1) / OP_BN, (M + OP_BM - 1) / OP_BM);
+    if (times) CUDA_CHECK(cudaEventRecord(start));
+    gemm_kernel_opt<<<gridsize_CV, blocksize_opt>>>(output, C, V, M, d, N);
+    CUDA_CHECK(cudaGetLastError());
+#else
+    dim3 blocksize(16, 16);
+    dim3 gridsize_CV((d + 16 - 1) / 16, (M + 16 - 1) / 16);
+    if (times) CUDA_CHECK(cudaEventRecord(start));
+    gemm_kernel<<<gridsize_CV, blocksize>>>(output, C, V, M, d, N);
+    CUDA_CHECK(cudaGetLastError());
+#endif
+    if (times) record_kernel_time(start, stop, &times->cv_gemm_ms);
+
+    CUDA_CHECK(cudaFree(C));
+}
+#endif
+
 extern "C" void solve(const float* Q,
                       const float* K,
                       const float* V,
@@ -416,7 +589,18 @@ extern "C" void solve(const float* Q,
                       int M,
                       int N,
                       int d) {
+
+#if USE_QKT_SOFTMAX_FUSED
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    solve_qkt_softmax_fused(Q, K, V, output, M, N, d, nullptr, start, stop);
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+#else
     solve_impl(Q, K, V, output, M, N, d, nullptr, nullptr, nullptr);
+#endif
 }
 
 void init_matrix(float* mat, int size) {
@@ -519,8 +703,13 @@ float benchmark_solve(const float* d_Q,
     for (int i = 0; i < BENCH_ITERS; ++i) {
         CUDA_CHECK(cudaMemset(d_output, 0, output_bytes));
         CUDA_CHECK(cudaEventRecord(start));
+#if USE_QKT_SOFTMAX_FUSED
+        solve_qkt_softmax_fused(d_Q, d_K, d_V, d_output, M, N, d,
+                                per_kernel_times, kernel_start, kernel_stop);
+#else
         solve_impl(d_Q, d_K, d_V, d_output, M, N, d,
                    per_kernel_times, kernel_start, kernel_stop);
+#endif
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
 
@@ -602,19 +791,39 @@ int main(int argc, char** argv) {
 
     printf("Softmax Attention Example\n");
     printf("  Shape: M=%d, N=%d, d=%d\n", M, N, d);
+#if USE_QKT_SOFTMAX_FUSED
+    printf("  Flow: fused Q*K^T + softmax -> Prob*V\n");
+    printf("  Fused kernel: qkt_softmax_fused_kernel (student implementation)\n");
+#else
     printf("  Flow: transpose(K) -> Q*K^T -> softmax -> Prob*V\n");
+#endif
 #ifdef USE_SELECTED_OUTER_GEMM
+#if USE_QKT_SOFTMAX_FUSED
+    printf("  GEMM kernel: fused QK^T+softmax + normal outer GEMM (USE_OUTER_GEMM=1)\n");
+    printf("  K transpose: not used; qkt_softmax_fused_kernel reads K[N,d] directly\n");
+#else
     printf("  GEMM kernel: QK^T outer GEMM + normal outer GEMM (USE_OUTER_GEMM=1)\n");
     printf("  K transpose: embedded in qkt_gemm_kernel_opt\n");
+#endif
+#else
+#if USE_QKT_SOFTMAX_FUSED
+    printf("  GEMM kernel: fused QK^T+softmax + naive ProbV GEMM (USE_OUTER_GEMM=0)\n");
+    printf("  K transpose: not used; qkt_softmax_fused_kernel reads K[N,d] directly\n");
 #else
     printf("  GEMM kernel: naive GEMM (USE_OUTER_GEMM=0)\n");
     printf("  K transpose: external transpose_kernel\n");
+#endif
 #endif
     printf("  Timing: %d warmup runs, then average of %d timed runs\n",
            WARMUP_ITERS,
            BENCH_ITERS);
     printf("  Average time: %.4f ms\n", ms);
     printf("  Kernel average times:\n");
+#if USE_QKT_SOFTMAX_FUSED
+    printf("    transpose(K): not used\n");
+    printf("    Q*K^T + softmax: %.4f ms\n", per_kernel_times.qk_gemm_ms);
+    printf("    softmax:      fused above\n");
+#else
 #ifdef USE_SELECTED_OUTER_GEMM
     printf("    transpose(K): embedded, no standalone kernel\n");
 #else
@@ -622,6 +831,7 @@ int main(int argc, char** argv) {
 #endif
     printf("    Q*K^T GEMM:   %.4f ms\n", per_kernel_times.qk_gemm_ms);
     printf("    softmax:      %.4f ms\n", per_kernel_times.softmax_ms);
+#endif
     printf("    Prob*V GEMM:  %.4f ms\n", per_kernel_times.cv_gemm_ms);
     printf("  Max abs diff vs CPU reference: %.8f\n", diff);
     printf("  Result: %s\n", diff < 1e-3f ? "PASS" : "FAIL");

@@ -412,15 +412,19 @@ nvcc -std=c++17 -arch=sm_75 -DUSE_OUTER_GEMM=0 softmax_attention.cu -o softmax_a
 
 # 外积分块 GEMM 路径，默认开启
 nvcc -std=c++17 -arch=sm_75 softmax_attention.cu -o softmax_attention
+
+# 教学版 QK^T + softmax 融合路径
+nvcc -std=c++17 -arch=sm_75 -DUSE_QKT_SOFTMAX_FUSED=1 softmax_attention.cu -o softmax_attention_qkt_softmax
 ```
 
 测试结果：
 
-| 路径 | 总平均时间 | transpose(K) | QK^T GEMM | softmax | ProbV GEMM | 校验 |
-|------|----------------|--------------|-----------|---------|------------|-------|
+| 路径 | 总平均时间 | transpose(K) | QK^T / QK^T+softmax | softmax | ProbV GEMM | 校验 |
+|------|----------------|--------------|----------------------|---------|------------|-------|
 | 朴素 GEMM | 28.3881 ms | 0.0555 ms | 12.5251 ms | 1.2897 ms | 12.4880 ms | PASS |
 | 外积分块 GEMM | 5.4300 ms | 0.0628 ms | 1.1591 ms | 1.5600 ms | 1.1574 ms | PASS |
 | 外积分块 GEMM + 嵌入式 K 转置 + block 级 softmax | 4.1625 ms | 已嵌入 | 2.0673 ms | 0.0646 ms | 1.1554 ms | PASS |
+| QK^T + softmax 融合 | 59.0116 ms | 不使用 | 56.7703 ms | 已融合 | 0.9379 ms | PASS |
 
 结果分析：
 
@@ -439,3 +443,16 @@ nvcc -std=c++17 -arch=sm_75 softmax_attention.cu -o softmax_attention
 访存连续性不如显式转置后的 `K_trans`，因此 `QK^T GEMM` 时间从
 `1.1591 ms` 增加到 `2.0673 ms`。不过由于 block 级 softmax 带来的收益更大，
 总平均时间仍然进一步下降到 `4.1625 ms`。
+
+当前简易版实现的 `QK^T + softmax` 融合路径将 score 计算、缩放、行最大值归约、
+`exp` 求和与归一化放入同一个 kernel，避免了单独的 softmax kernel 调度，
+也不再需要外部 K 转置。该路径的优势是计算流程更接近 attention 融合的思想：
+`QK^T` 的结果不再作为未归一化 score 单独落地后再由另一个 kernel 处理，
+而是在同一 kernel 内直接转化为概率矩阵。
+
+但当前融合 kernel，采用“一 block 处理一行”的映射方式，
+没有复用外积分块 GEMM 中的 `OP_BM x OP_BN x OP_BK` 分块、shared memory
+搬运和寄存器级 micro tile。因此 `QK^T + softmax` 阶段耗时达到
+`56.7703 ms`，显著慢于外积分块 GEMM 加 block 级 softmax 的组合路径。
+这说明算子融合并不天然意味着更快：只有在融合后仍然保持高效的矩阵分块、
+访存合并、数据复用和并行归约时，融合才能转化为实际性能收益。
